@@ -6,6 +6,8 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-19
+
 ### Added
 
 - Range requests send the file's `ETag` (only a strong one) or
@@ -13,6 +15,22 @@ All notable changes to ODM are documented here. The format is based on
   file on the server has changed, the partial file is discarded and the
   download starts again from the first byte. A `200` response whose range
   already covers the whole file is kept when that validator still matches.
+
+### Changed
+
+- A download that uses several connections fetches each part over HTTP/1.1,
+  so each connection has its own socket. A single stream can still use HTTP/2.
+- An idle connection takes the tail of the chunk that will take the longest
+  to finish, once that chunk is at least twice as slow as the fastest one.
+  A connection that has gone quiet counts as the slowest. Until a pace is
+  known, the largest remainder is used.
+- Connections open one at a time. The next one starts once file bytes
+  arrive on any connection after the last one opened, up to the configured
+  limit: a server that refuses or never answers is not asked on more
+  connections, and one stalled connection does not keep the rest closed.
+- When the first chunk of a file gets the whole file as a `200`, that
+  response is kept and runs to the end of the file on one connection,
+  instead of being dropped and the rest asked for again.
 
 ### Fixed
 
@@ -31,22 +49,6 @@ All notable changes to ODM are documented here. The format is based on
 - A connection that keeps bringing some bytes between stalls is no longer
   given up on after the retry limit: an attempt that stored bytes does not
   count against it. Attempts with no progress still run out.
-
-### Changed
-
-- A download that uses several connections fetches each part over HTTP/1.1,
-  so each connection has its own socket. A single stream can still use HTTP/2.
-- An idle connection takes the tail of the chunk that will take the longest
-  to finish, once that chunk is at least twice as slow as the fastest one.
-  A connection that has gone quiet counts as the slowest. Until a pace is
-  known, the largest remainder is used.
-- Connections open one at a time. The next one starts once file bytes
-  arrive on any connection after the last one opened, up to the configured
-  limit: a server that refuses or never answers is not asked on more
-  connections, and one stalled connection does not keep the rest closed.
-- When the first chunk of a file gets the whole file as a `200`, that
-  response is kept and runs to the end of the file on one connection,
-  instead of being dropped and the rest asked for again.
 
 ## [0.4.3] - 2026-10-19
 
@@ -346,7 +348,8 @@ All notable changes to ODM are documented here. The format is based on
   instance); no TCP port is opened unless `-serve` is given, and that
   listener requires a per-run token and rejects foreign origins.
 
-[Unreleased]: https://github.com/troke12/odm/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/troke12/odm/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/troke12/odm/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/troke12/odm/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/troke12/odm/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/troke12/odm/compare/v0.4.0...v0.4.1
