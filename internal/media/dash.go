@@ -121,11 +121,35 @@ type trackAttrs struct {
 }
 
 type adaptXML struct {
-	Lang     string    `xml:"lang,attr"`
-	BaseURLs []string  `xml:"BaseURL"`
-	Reps     []reprXML `xml:"Representation"`
+	Lang       string          `xml:"lang,attr"`
+	BaseURLs   []string        `xml:"BaseURL"`
+	Reps       []reprXML       `xml:"Representation"`
+	Essential  []protectionXML `xml:"EssentialProperty"`
+	Supplement []protectionXML `xml:"SupplementalProperty"`
 	trackAttrs
 	segmentInfo
+}
+
+// trickModeScheme (DASH-IF IOP) marks an AdaptationSet as a trick-mode
+// track: very low frame rate or I-frame-only, meant for a scrub bar, not
+// normal playback. Signalled as an Essential- or SupplementalProperty on
+// the AdaptationSet itself (the common case this handles) or, per spec,
+// possibly on a Representation instead (not checked: every real-world
+// encoder marks it at the AdaptationSet the whole track belongs to).
+const trickModeScheme = "http://dashif.org/guidelines/trickmode"
+
+func isTrickMode(as adaptXML) bool {
+	for _, p := range as.Essential {
+		if p.Scheme == trickModeScheme {
+			return true
+		}
+	}
+	for _, p := range as.Supplement {
+		if p.Scheme == trickModeScheme {
+			return true
+		}
+	}
+	return false
 }
 
 type reprXML struct {
@@ -232,6 +256,12 @@ func ParseDASH(base *url.URL, data []byte) (*DASHManifest, error) {
 
 		periodBase := withBase(mpdBase, p.BaseURLs)
 		for _, as := range p.Sets {
+			if isTrickMode(as) {
+				// Fast-forward/rewind scrub track, not meant for normal
+				// playback: offering it as a quality choice would let
+				// someone pick a choppy, I-frame-only "representation".
+				continue
+			}
 			setBase := withBase(periodBase, as.BaseURLs)
 			for _, rx := range as.Reps {
 				rep := DASHRepresentation{
@@ -577,7 +607,12 @@ func formatInt(n int64, format string) string {
 	return strings.Repeat("0", width-len(s)) + s
 }
 
-// withBase resolves the first of urls against base; with none it keeps base.
+// withBase resolves the first of urls against base; with none it keeps
+// base. Resolving through resolveRef (not base.Parse directly) carries a
+// query string set on base down to the result when they share an origin,
+// so a token on the manifest's own URL survives every BaseURL level
+// (MPD → Period → AdaptationSet → Representation) even when some of them
+// repoint to a same-origin path with no query of their own.
 func withBase(base *url.URL, urls []string) *url.URL {
 	for _, u := range urls {
 		u = strings.TrimSpace(u)
@@ -590,7 +625,7 @@ func withBase(base *url.URL, urls []string) *url.URL {
 			}
 			continue
 		}
-		if p, err := base.Parse(u); err == nil {
+		if p, err := resolveRef(base, u); err == nil {
 			return p
 		}
 	}

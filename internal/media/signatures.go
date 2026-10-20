@@ -195,15 +195,59 @@ func seconds(v float64) (time.Duration, bool) {
 	return time.Duration(v * float64(time.Second)), true
 }
 
-// resolve makes ref absolute against base; a nil base leaves ref as is.
+// resolve makes ref absolute against base, as a string; a nil base leaves
+// ref as is. See resolveRef for the query string it may carry onto ref.
 func resolve(base *url.URL, ref string) string {
 	ref = strings.TrimSpace(ref)
 	if base == nil {
 		return ref
 	}
-	u, err := base.Parse(ref)
+	u, err := resolveRef(base, ref)
 	if err != nil {
 		return ref
 	}
 	return u.String()
+}
+
+// resolveRef is resolve, but keeping the *url.URL: dash.go's BaseURL
+// cascade (MPD → Period → AdaptationSet → Representation) needs the parsed
+// form at each level, so a query carried onto one level's BaseURL is still
+// there to carry further at the next.
+//
+// When ref resolves to a same-origin URL with no query string of its own,
+// base's query string is carried onto it: some CDNs put an auth token in
+// the manifest's own URL and expect every segment request to repeat it,
+// without the manifest spelling it out on each segment URI. Carrying it
+// across origins would leak a host-specific token to a different CDN host,
+// so that case is left alone.
+func resolveRef(base *url.URL, ref string) (*url.URL, error) {
+	u, err := base.Parse(strings.TrimSpace(ref))
+	if err != nil {
+		return nil, err
+	}
+	if u.RawQuery == "" && base.RawQuery != "" && sameOrigin(base, u) {
+		u.RawQuery = base.RawQuery
+	}
+	return u, nil
+}
+
+// sameOrigin compares scheme, host and effective port (the default for the
+// scheme when the URL does not spell out a port).
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
 }

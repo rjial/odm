@@ -518,3 +518,123 @@ func TestReviewRound2(t *testing.T) {
 		}
 	}
 }
+
+// TestQueryPropagation covers resolve/resolveRef/withBase carrying the
+// manifest's own query string onto same-origin child URLs that have none
+// of their own (an auth token on the manifest URL some CDNs expect every
+// request to repeat), and leaving it off cross-origin ones or ones that
+// already have a query of their own.
+func TestQueryPropagation(t *testing.T) {
+	t.Run("HLS media segment inherits the playlist's query", func(t *testing.T) {
+		m3u8 := "#EXTM3U\n#EXTINF:2,\nseg1.ts\n#EXTINF:2,\nhttps://cdn.example/seg2.ts?already=1\n#EXT-X-ENDLIST\n"
+		p, err := ParseHLS(mustURL("https://example.com/v/index.m3u8?token=abc"), []byte(m3u8))
+		if err != nil {
+			t.Fatal(err)
+		}
+		segs := p.Media.Segments
+		if segs[0].URL != "https://example.com/v/seg1.ts?token=abc" {
+			t.Fatalf("same-origin, no query of its own: %q", segs[0].URL)
+		}
+		if segs[1].URL != "https://cdn.example/seg2.ts?already=1" {
+			t.Fatalf("already has a query, and cross-origin: %q", segs[1].URL)
+		}
+	})
+
+	t.Run("HLS key on another host does not get the playlist's query", func(t *testing.T) {
+		m3u8 := "#EXTM3U\n" +
+			"#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.example/k1\"\n" +
+			"#EXTINF:2,\nseg1.ts\n#EXT-X-ENDLIST\n"
+		p, err := ParseHLS(mustURL("https://example.com/v/index.m3u8?token=abc"), []byte(m3u8))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Media.Segments[0].Key.URL != "https://keys.example/k1" {
+			t.Fatalf("key url: %q", p.Media.Segments[0].Key.URL)
+		}
+	})
+
+	t.Run("HLS master variant inherits the master playlist's query", func(t *testing.T) {
+		m3u8 := "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv1/index.m3u8\n"
+		p, err := ParseHLS(mustURL("https://example.com/v/master.m3u8?token=abc"), []byte(m3u8))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Master.Variants[0].URL != "https://example.com/v/v1/index.m3u8?token=abc" {
+			t.Fatalf("variant url: %q", p.Master.Variants[0].URL)
+		}
+	})
+
+	t.Run("DASH segment inherits the MPD's query through a same-origin BaseURL", func(t *testing.T) {
+		mpd := `<MPD mediaPresentationDuration="PT2S"><Period><BaseURL>v/</BaseURL><AdaptationSet><Representation id="r">` +
+			`<SegmentTemplate media="seg-$Number$.m4s" timescale="1" duration="1" startNumber="1"/>` +
+			`</Representation></AdaptationSet></Period></MPD>`
+		out, err := ParseDASH(mustURL("https://example.com/m.mpd?token=abc"), []byte(mpd))
+		if err != nil {
+			t.Fatal(err)
+		}
+		segs := out.Periods[0].Representations[0].Segments
+		if segs[0].URL != "https://example.com/v/seg-1.m4s?token=abc" {
+			t.Fatalf("segment url: %q", segs[0].URL)
+		}
+	})
+
+	t.Run("DASH AdaptationSet marked trick-mode (EssentialProperty) is excluded", func(t *testing.T) {
+		mpd := `<MPD mediaPresentationDuration="PT2S"><Period><BaseURL>https://h/v/</BaseURL>` +
+			`<AdaptationSet id="0"><Representation id="main" mimeType="video/mp4"><SegmentBase/></Representation></AdaptationSet>` +
+			`<AdaptationSet id="1"><EssentialProperty schemeIdUri="http://dashif.org/guidelines/trickmode" value="0"/>` +
+			`<Representation id="trick" mimeType="video/mp4"><SegmentBase/></Representation></AdaptationSet>` +
+			`</Period></MPD>`
+		out, err := ParseDASH(mustURL("https://h/m.mpd"), []byte(mpd))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reps := out.Periods[0].Representations
+		if len(reps) != 1 || reps[0].ID != "main" {
+			t.Fatalf("expected only the main representation, got %+v", reps)
+		}
+	})
+
+	t.Run("DASH AdaptationSet marked trick-mode (SupplementalProperty) is excluded", func(t *testing.T) {
+		mpd := `<MPD mediaPresentationDuration="PT2S"><Period><BaseURL>https://h/v/</BaseURL>` +
+			`<AdaptationSet id="0"><Representation id="main" mimeType="video/mp4"><SegmentBase/></Representation></AdaptationSet>` +
+			`<AdaptationSet id="1"><SupplementalProperty schemeIdUri="http://dashif.org/guidelines/trickmode" value="0"/>` +
+			`<Representation id="trick" mimeType="video/mp4"><SegmentBase/></Representation></AdaptationSet>` +
+			`</Period></MPD>`
+		out, err := ParseDASH(mustURL("https://h/m.mpd"), []byte(mpd))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reps := out.Periods[0].Representations
+		if len(reps) != 1 || reps[0].ID != "main" {
+			t.Fatalf("expected only the main representation, got %+v", reps)
+		}
+	})
+
+	t.Run("DASH an unrelated EssentialProperty does not exclude the AdaptationSet", func(t *testing.T) {
+		mpd := `<MPD mediaPresentationDuration="PT2S"><Period><BaseURL>https://h/v/</BaseURL>` +
+			`<AdaptationSet id="0"><EssentialProperty schemeIdUri="urn:mpeg:dash:some-other-scheme:2013" value="x"/>` +
+			`<Representation id="r" mimeType="video/mp4"><SegmentBase/></Representation></AdaptationSet>` +
+			`</Period></MPD>`
+		out, err := ParseDASH(mustURL("https://h/m.mpd"), []byte(mpd))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out.Periods[0].Representations) != 1 {
+			t.Fatalf("representation wrongly excluded: %+v", out.Periods[0].Representations)
+		}
+	})
+
+	t.Run("DASH BaseURL on another host does not get the MPD's query", func(t *testing.T) {
+		mpd := `<MPD mediaPresentationDuration="PT2S"><Period><BaseURL>https://cdn.example/v/</BaseURL><AdaptationSet><Representation id="r">` +
+			`<SegmentTemplate media="seg-$Number$.m4s" timescale="1" duration="1" startNumber="1"/>` +
+			`</Representation></AdaptationSet></Period></MPD>`
+		out, err := ParseDASH(mustURL("https://example.com/m.mpd?token=abc"), []byte(mpd))
+		if err != nil {
+			t.Fatal(err)
+		}
+		segs := out.Periods[0].Representations[0].Segments
+		if segs[0].URL != "https://cdn.example/v/seg-1.m4s" {
+			t.Fatalf("segment url: %q", segs[0].URL)
+		}
+	})
+}
