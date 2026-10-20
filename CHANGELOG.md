@@ -6,6 +6,14 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Extension: a download whose URL carries no file extension (Google
+  Drive's `/uc` and `/download` endpoints, for instance) is no longer
+  missed when the browser has not yet resolved its suggested filename at
+  the moment the download starts; the extension now holds it and waits
+  briefly for that name before giving up.
+
 ## [0.5.0] - 2026-10-19
 
 ### Added

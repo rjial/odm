@@ -153,6 +153,55 @@ test("configFresh keeps ODM's answer longer than the fallback", () => {
   assert.equal(bg.configFresh({ ok: false, at: now - bg.CONFIG_RETRY_MS }, now), false);
 });
 
+test("resolvedFilename resolves from a search already settled", async () => {
+  globalThis.chrome = {
+    downloads: {
+      onChanged: { addListener() {}, removeListener() {} },
+      search(_q, cb) { cb([{ filename: "/home/u/Downloads/report.pdf" }]); },
+    },
+  };
+  try {
+    assert.equal(await bg.resolvedFilename(1, 1000), "/home/u/Downloads/report.pdf");
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+test("resolvedFilename waits for onChanged when search finds nothing yet", async () => {
+  let listener;
+  globalThis.chrome = {
+    downloads: {
+      onChanged: {
+        addListener(fn) { listener = fn; },
+        removeListener() { listener = undefined; },
+      },
+      search(_q, cb) {
+        setTimeout(() => listener && listener({ id: 7, filename: { current: "/home/u/Downloads/archive.zip" } }), 5);
+        cb([]);
+      },
+    },
+  };
+  try {
+    assert.equal(await bg.resolvedFilename(7, 1000), "/home/u/Downloads/archive.zip");
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
+test("resolvedFilename gives up after ms with no name", async () => {
+  globalThis.chrome = {
+    downloads: {
+      onChanged: { addListener() {}, removeListener() {} },
+      search(_q, cb) { cb([{}]); },
+    },
+  };
+  try {
+    assert.equal(await bg.resolvedFilename(1, 20), "");
+  } finally {
+    delete globalThis.chrome;
+  }
+});
+
 test("getConfig with ODM down asks once, for concurrent calls and after", async () => {
   // A fake chrome with ODM unreachable: each sendNativeMessage is one host
   // process the browser would start.

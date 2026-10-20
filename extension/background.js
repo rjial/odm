@@ -23,6 +23,12 @@ const CONFIG_TTL_MS = 5 * 60 * 1000;
 const CONFIG_RETRY_MS = 30 * 1000;
 const MAX_MEDIA_PER_TAB = 15;
 const BYPASS_MS = 10 * 1000;
+// How long to wait for the browser to resolve a download's suggested
+// filename when the URL itself carries no extension (Google Drive's "/uc"
+// and "/download" endpoints, for instance): Content-Disposition is parsed
+// and the name picked shortly after onCreated fires, not synchronously
+// with it.
+const FILENAME_WAIT_MS = 3000;
 
 const STREAM_TYPES = [
   "application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl", "audio/x-mpegurl",
@@ -295,6 +301,32 @@ async function handOff(fields) {
   });
 }
 
+// resolvedFilename waits up to ms for chrome.downloads to settle
+// downloadId's target filename, for a download whose URL has no extension
+// to judge by. "" if it never resolves in time (ODM then has nothing to
+// take over with, so the download is left alone).
+function resolvedFilename(downloadId, ms) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (name) => {
+      if (done) return;
+      done = true;
+      chrome.downloads.onChanged.removeListener(onChanged);
+      resolve(name || "");
+    };
+    const onChanged = (delta) => {
+      if (delta.id === downloadId && delta.filename && delta.filename.current) finish(delta.filename.current);
+    };
+    chrome.downloads.onChanged.addListener(onChanged);
+    // The name may already be settled by the time this runs.
+    chrome.downloads.search({ id: downloadId }, (items) => {
+      const it = items && items[0];
+      if (it && it.filename) finish(it.filename);
+    });
+    setTimeout(() => finish(""), ms);
+  });
+}
+
 const tabKey = (tabId) => `media:${tabId}`;
 
 // sameDocument reports whether two URLs differ only in their #hash.
@@ -450,13 +482,28 @@ if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
     const { bypass = {} } = await chrome.storage.session.get("bypass");
     if (bypass[url] && Date.now() - bypass[url] < BYPASS_MS) return; // Alt-click
     const cfg = await getConfig();
-    if (isExcluded(url, cfg.excludeSites) || !hasType(url, cfg.fileTypes, item.filename)) return;
+    if (isExcluded(url, cfg.excludeSites)) return;
+
+    let filename = item.filename || "";
+    let paused = false;
+    // A URL with no extension of its own (Google Drive's "/uc" and
+    // "/download" endpoints, for instance) leaves the file-type check
+    // entirely dependent on the suggested filename, which is not always
+    // in yet: hold the download and wait for it rather than miss it.
+    if (!urlExt(url) && !hasType(url, cfg.fileTypes, filename)) {
+      try { await chrome.downloads.pause(item.id); paused = true; } catch { /* may already be done */ }
+      filename = await resolvedFilename(item.id, FILENAME_WAIT_MS);
+    }
+    if (!hasType(url, cfg.fileTypes, filename)) {
+      if (paused) { try { await chrome.downloads.resume(item.id); } catch { /* finished meanwhile */ } }
+      return;
+    }
 
     // Hold the browser's copy until ODM confirms; it used to be cancelled
     // first, so with ODM closed or unregistered the download was lost.
-    try { await chrome.downloads.pause(item.id); } catch { /* may already be done */ }
+    if (!paused) { try { await chrome.downloads.pause(item.id); } catch { /* may already be done */ } }
     const reply = await handOff({
-      url, referrer: item.referrer || "", filename: item.filename || "",
+      url, referrer: item.referrer || "", filename,
       mime: item.mime || "", size: item.totalBytes > 0 ? item.totalBytes : 0,
     });
     if (reply.ok) {
@@ -589,5 +636,5 @@ if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { hasType, configFresh, getConfig, hostMatches, isExcluded, mediaKind, streamFormat, normalizeMediaURL, totalSize, mergeMedia, popupReferrer, describePlaylist, sameDocument, DEFAULT_TYPES, CONFIG_TTL_MS, CONFIG_RETRY_MS };
+  module.exports = { hasType, configFresh, getConfig, hostMatches, isExcluded, mediaKind, streamFormat, normalizeMediaURL, totalSize, mergeMedia, popupReferrer, describePlaylist, sameDocument, resolvedFilename, urlExt, DEFAULT_TYPES, CONFIG_TTL_MS, CONFIG_RETRY_MS };
 }
