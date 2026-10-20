@@ -98,7 +98,7 @@ func TestVersion(t *testing.T) {
 }
 
 func TestMergeArgs(t *testing.T) {
-	got := strings.Join(mergeArgs("v.webm", "a.webm", "out.webm.merging", "webm"), " ")
+	got := strings.Join(mergeArgs("v.webm", "a.webm", "out.webm.merging", "webm", false), " ")
 	want := "-hide_banner -loglevel error -nostdin -y -i v.webm -i a.webm -map 0:v:0 -map 1:a:0 -c copy -f webm out.webm.merging"
 	if got != want {
 		t.Fatalf("args\n got %s\nwant %s", got, want)
@@ -110,6 +110,51 @@ func TestMergeArgs(t *testing.T) {
 	}
 }
 
+func TestRepairTimelineArgs(t *testing.T) {
+	got := strings.Join(mergeArgs("v.mp4", "a.mp4", "out.mp4.merging", "mp4", true), " ")
+	want := "-hide_banner -loglevel error -nostdin -y -fflags +genpts -i v.mp4 -i a.mp4 -map 0:v:0 -map 1:a:0 -c copy -f mp4 out.mp4.merging"
+	if got != want {
+		t.Fatalf("merge args with repairTimeline\n got %s\nwant %s", got, want)
+	}
+	gotRemux := strings.Join(remuxArgs("out.mp4.remuxing", "mp4", true), " ")
+	wantRemux := "-hide_banner -loglevel error -y -fflags +genpts -f mpegts -i pipe:0 -map 0:v? -map 0:a? -c copy -f mp4 out.mp4.remuxing"
+	if gotRemux != wantRemux {
+		t.Fatalf("remux args with repairTimeline\n got %s\nwant %s", gotRemux, wantRemux)
+	}
+	// false leaves no -fflags at all, not just an empty value.
+	if strings.Contains(strings.Join(mergeArgs("v", "a", "o", "mp4", false), " "), "genpts") {
+		t.Fatal("repairTimeline=false should not add -fflags +genpts")
+	}
+}
+
+func TestRepair(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "joined.mp4")
+	os.WriteFile(in, []byte("JOINED"), 0o644)
+	out := filepath.Join(dir, "clip.mp4")
+
+	bin := fake(t, t.TempDir(), "ok")
+	if err := Repair(context.Background(), bin, in, out); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(out); string(b) != "JOINED" {
+		t.Fatalf("output %q", b)
+	}
+	if _, err := os.Stat(out + ".repairing"); !os.IsNotExist(err) {
+		t.Fatal("temporary file left behind")
+	}
+
+	os.Remove(out)
+	bin = fake(t, t.TempDir(), "fail")
+	err := Repair(context.Background(), bin, in, out)
+	if err == nil || !strings.Contains(err.Error(), "Could not find tag") {
+		t.Fatalf("failure: %v", err)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatal("output left behind after failure")
+	}
+}
+
 func TestMerge(t *testing.T) {
 	dir := t.TempDir()
 	video, audio := filepath.Join(dir, "v"), filepath.Join(dir, "a")
@@ -118,7 +163,7 @@ func TestMerge(t *testing.T) {
 	out := filepath.Join(dir, "clip.mp4")
 
 	bin := fake(t, t.TempDir(), "ok")
-	if err := Merge(context.Background(), bin, video, audio, out); err != nil {
+	if err := Merge(context.Background(), bin, video, audio, out, false); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(out); string(b) != "VIDEOAUDIO" {
@@ -131,7 +176,7 @@ func TestMerge(t *testing.T) {
 	// A failure reports ffmpeg's message and leaves no output.
 	os.Remove(out)
 	bin = fake(t, t.TempDir(), "fail")
-	err := Merge(context.Background(), bin, video, audio, out)
+	err := Merge(context.Background(), bin, video, audio, out, false)
 	if err == nil || !strings.Contains(err.Error(), "Could not find tag") {
 		t.Fatalf("failure: %v", err)
 	}
@@ -145,7 +190,7 @@ func TestMerge(t *testing.T) {
 	bin = fake(t, t.TempDir(), "hang")
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	if err := Merge(ctx, bin, video, audio, out); !errors.Is(err, context.DeadlineExceeded) {
+	if err := Merge(ctx, bin, video, audio, out, false); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("cancel: %v", err)
 	}
 }
@@ -166,7 +211,7 @@ func TestRealFFmpeg(t *testing.T) {
 	gen("-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=10", "-c:v", "libx264", video)
 	gen("-f", "lavfi", "-i", "sine=duration=1", "-c:a", "aac", audio)
 	out := filepath.Join(dir, "clip.mp4")
-	if err := Merge(context.Background(), bin, video, audio, out); err != nil {
+	if err := Merge(context.Background(), bin, video, audio, out, false); err != nil {
 		t.Fatal(err)
 	}
 	if runtime.GOOS != "windows" {

@@ -89,21 +89,35 @@ func muxer(out string) string {
 	return "matroska"
 }
 
-func mergeArgs(video, audio, tmp, format string) []string {
-	return []string{
-		"-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+// genptsArgs asks ffmpeg to regenerate presentation timestamps instead of
+// trusting the ones in the input: a join across an HLS EXT-X-DISCONTINUITY
+// (encoding parameters reset mid-stream, e.g. an ad break) otherwise keeps
+// whatever jump or reset was there, which can desync audio and video from
+// that point on. Harmless to pass when nothing needs repairing.
+func genptsArgs(repairTimeline bool) []string {
+	if repairTimeline {
+		return []string{"-fflags", "+genpts"}
+	}
+	return nil
+}
+
+func mergeArgs(video, audio, tmp, format string, repairTimeline bool) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y"}
+	args = append(args, genptsArgs(repairTimeline)...)
+	return append(args,
 		"-i", video, "-i", audio,
 		"-map", "0:v:0", "-map", "1:a:0",
 		"-c", "copy",
 		"-f", format, tmp,
-	}
+	)
 }
 
 // Merge joins video and audio into out. The inputs are left in place; the
 // caller removes them once it no longer needs them for a retry.
-func Merge(ctx context.Context, bin, video, audio, out string) error {
+// repairTimeline: see genptsArgs.
+func Merge(ctx context.Context, bin, video, audio, out string, repairTimeline bool) error {
 	tmp := out + ".merging"
-	return run(ctx, bin, mergeArgs(video, audio, tmp, muxer(out)), nil, tmp, out, "merge")
+	return run(ctx, bin, mergeArgs(video, audio, tmp, muxer(out), repairTimeline), nil, tmp, out, "merge")
 }
 
 // remuxArgs copies the video and audio of an MPEG-TS read from standard
@@ -111,23 +125,44 @@ func Merge(ctx context.Context, bin, video, audio, out string) error {
 // MPEG-TS stream often carries a timed ID3 metadata track, which MP4
 // cannot hold and would make ffmpeg fail. No -nostdin here: the input is
 // standard input (ffmpeg turns off its keyboard handling by itself then).
-func remuxArgs(tmp, format string) []string {
-	return []string{
-		"-hide_banner", "-loglevel", "error", "-y",
+func remuxArgs(tmp, format string, repairTimeline bool) []string {
+	args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	args = append(args, genptsArgs(repairTimeline)...)
+	return append(args,
 		"-f", "mpegts", "-i", "pipe:0",
 		"-map", "0:v?", "-map", "0:a?",
 		"-c", "copy",
 		"-f", format, tmp,
-	}
+	)
 }
 
 // RemuxTS rewrites the MPEG-TS read from in into the container out's name
 // asks for, without re-encoding (a recording into MP4, which more players
 // open and seek in). Reading from in rather than a file saves writing the
-// joined MPEG-TS to disk first.
-func RemuxTS(ctx context.Context, bin string, in io.Reader, out string) error {
+// joined MPEG-TS to disk first. repairTimeline: see genptsArgs.
+func RemuxTS(ctx context.Context, bin string, in io.Reader, out string, repairTimeline bool) error {
 	tmp := out + ".remuxing"
-	return run(ctx, bin, remuxArgs(tmp, muxer(out)), in, tmp, out, "remux")
+	return run(ctx, bin, remuxArgs(tmp, muxer(out), repairTimeline), in, tmp, out, "remux")
+}
+
+func repairArgs(in, tmp, format string) []string {
+	return []string{
+		"-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+		"-fflags", "+genpts",
+		"-i", in,
+		"-c", "copy",
+		"-f", format, tmp,
+	}
+}
+
+// Repair re-mixes a single already-complete file back into its own
+// container (-c copy: no re-encode), regenerating timestamps the same way
+// Merge/RemuxTS can. For the one assembly path that otherwise never calls
+// ffmpeg at all (a single track, concatenated as is): the only way to
+// still repair a discontinuity there is this extra pass.
+func Repair(ctx context.Context, bin, in, out string) error {
+	tmp := out + ".repairing"
+	return run(ctx, bin, repairArgs(in, tmp, muxer(out)), nil, tmp, out, "repair")
 }
 
 // run runs ffmpeg writing tmp and renames it to out on success. On failure

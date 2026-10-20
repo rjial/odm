@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -202,6 +203,111 @@ func TestStreamFMP4ByteRanges(t *testing.T) {
 	}
 	if d.Info().FileName != "clip.mp4" {
 		t.Fatalf("name %q", d.Info().FileName)
+	}
+}
+
+// fakeFFmpegFile writes a shell script standing in for ffmpeg that reads a
+// real -i file argument (not standard input, unlike fakeFFmpeg in
+// remux_test.go, which simulates the piped TS remux): "ok" copies it,
+// tagged, to the output (the last argument), so a test can tell whether
+// this ran at all; "fail" exits with an error and no output.
+func fakeFFmpegFile(t *testing.T, mode string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script as ffmpeg")
+	}
+	bin := filepath.Join(t.TempDir(), "ffmpeg")
+	script := "#!/bin/sh\nin=\"\"\nfor a; do\n  if [ \"$prev\" = \"-i\" ]; then in=\"$a\"; fi\n  out=\"$a\"\n  prev=\"$a\"\ndone\n" +
+		"{ printf 'REPAIRED:'; cat \"$in\"; } > \"$out\"\n"
+	if mode == "fail" {
+		script = "#!/bin/sh\necho 'fake ffmpeg failure' >&2\nexit 1\n"
+	}
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setFFmpegPath(bin)
+	t.Cleanup(func() { setFFmpegPath(noFFmpeg) })
+	return bin
+}
+
+// fmp4DiscontinuousPlaylist is TestStreamFMP4ByteRanges' fixture with an
+// EXT-X-DISCONTINUITY between its first and second segment, so content's
+// middle byte range stands in for "after the discontinuity".
+func fmp4DiscontinuousPlaylist(content []byte) (string, func(w http.ResponseWriter, r *http.Request)) {
+	playlist := "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"all.mp4\",BYTERANGE=\"4@0\"\n" +
+		"#EXTINF:2,\n#EXT-X-BYTERANGE:6@4\nall.mp4\n" +
+		"#EXT-X-DISCONTINUITY\n#EXTINF:2,\n#EXT-X-BYTERANGE:6\nall.mp4\n#EXT-X-ENDLIST\n"
+	return playlist, func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "all.mp4", time.Time{}, bytes.NewReader(content))
+	}
+}
+
+// TestStreamFMP4DiscontinuityRepaired covers the one assembly path that
+// otherwise never involves ffmpeg at all (a single track, concatenated as
+// is): a playlist with EXT-X-DISCONTINUITY routes through
+// Download.repairSingleTrack (ffmpeg.Repair, -fflags +genpts) instead.
+func TestStreamFMP4DiscontinuityRepaired(t *testing.T) {
+	content := []byte("INITAAAAAABBBBBB")
+	playlist, serveContent := fmp4DiscontinuousPlaylist(content)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v.m3u8", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, playlist) })
+	mux.HandleFunc("/all.mp4", serveContent)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	fakeFFmpegFile(t, "ok")
+	d := newStreamDownload(t, srv.Client(), 4, StreamJob{Kind: media.KindHLS, Manifest: srv.URL + "/v.m3u8"})
+	d.Start(context.Background())
+	got := readResult(t, d)
+	want := append([]byte("REPAIRED:"), content...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("output %q, want %q (expected the repair pass to run)", got, want)
+	}
+}
+
+// TestStreamFMP4DiscontinuityNoFFmpegStillCompletes covers the same
+// playlist with no ffmpeg configured: the discontinuity's timestamp jump
+// is left as is, but the download is not held back by a missing optional
+// tool (same degrade-gracefully rule as everywhere else ffmpeg is used).
+func TestStreamFMP4DiscontinuityNoFFmpegStillCompletes(t *testing.T) {
+	content := []byte("INITAAAAAABBBBBB")
+	playlist, serveContent := fmp4DiscontinuousPlaylist(content)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v.m3u8", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, playlist) })
+	mux.HandleFunc("/all.mp4", serveContent)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	setFFmpegPath(filepath.Join(t.TempDir(), "no-ffmpeg-here"))
+	defer setFFmpegPath(noFFmpeg)
+	d := newStreamDownload(t, srv.Client(), 4, StreamJob{Kind: media.KindHLS, Manifest: srv.URL + "/v.m3u8"})
+	d.Start(context.Background())
+	if got := readResult(t, d); !bytes.Equal(got, content) {
+		t.Fatalf("output %q, want the plain concatenation %q", got, content)
+	}
+}
+
+// TestStreamFMP4DiscontinuityFFmpegFailureReported covers Repair failing:
+// the download reports the error rather than silently keeping the
+// unrepaired (or partial) file under the final name.
+func TestStreamFMP4DiscontinuityFFmpegFailureReported(t *testing.T) {
+	content := []byte("INITAAAAAABBBBBB")
+	playlist, serveContent := fmp4DiscontinuousPlaylist(content)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v.m3u8", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, playlist) })
+	mux.HandleFunc("/all.mp4", serveContent)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	fakeFFmpegFile(t, "fail")
+	d := newStreamDownload(t, srv.Client(), 4, StreamJob{Kind: media.KindHLS, Manifest: srv.URL + "/v.m3u8"})
+	d.Start(context.Background())
+	info := d.Info()
+	if info.Status != StatusError || !strings.Contains(info.Error, "repair") {
+		t.Fatalf("status %s: %q", info.Status, info.Error)
+	}
+	if _, err := os.Stat(filepath.Join(info.Dir, info.FileName)); !os.IsNotExist(err) {
+		t.Fatal("output left behind after a failed repair")
 	}
 }
 

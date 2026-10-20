@@ -120,6 +120,11 @@ type streamTrack struct {
 	segs    []piece
 	segInit []int // index into inits per segment, -1 for none
 	live    bool  // a recording: a skipped segment has no file
+	// discontinuous is set when the HLS media playlist had an
+	// EXT-X-DISCONTINUITY (encoding parameters reset, e.g. an ad break):
+	// assembleStream asks ffmpeg to regenerate timestamps (-fflags
+	// +genpts) across the join instead of concatenating them as is.
+	discontinuous bool
 }
 
 // permanentError is a refusal that retrying the same request cannot fix
@@ -402,6 +407,9 @@ func (d *Download) loadHLS(ctx context.Context, job StreamJob) ([]*streamTrack, 
 			}
 			t.segs = append(t.segs, piece{url: s.URL, rng: s.Range, key: s.Key, seq: s.Sequence})
 			t.segInit = append(t.segInit, idx)
+			if s.Discontinuity {
+				t.discontinuous = true
+			}
 		}
 		// An init section means fragmented MP4; otherwise MPEG-TS.
 		if len(t.inits) > 0 {
@@ -1213,6 +1221,16 @@ func (d *Download) assembleStream(ctx context.Context, tracks []*streamTrack) er
 		return d.remuxTS(ctx, target, tracks[0])
 	}
 	if len(tracks) == 1 {
+		if tracks[0].discontinuous {
+			if bin, ferr := ffmpeg.Locate(ffmpegConfigured()); ferr == nil {
+				_ = out.Close()
+				return d.repairSingleTrack(ctx, bin, target, ext, tracks[0])
+			}
+			// No ffmpeg: fall through to the plain concatenation below,
+			// same as a continuous track would get — the discontinuity's
+			// timestamp jump stays, but the download is not held back by
+			// a missing optional tool.
+		}
 		err := d.concat(ctx, out, 0, tracks[0])
 		if cerr := out.Close(); err == nil {
 			err = cerr
@@ -1244,10 +1262,37 @@ func (d *Download) assembleStream(ctx context.Context, tracks []*streamTrack) er
 		parts = append(parts, p)
 	}
 	merged := filepath.Join(d.workDir(), "merged"+ext)
-	if err := ffmpeg.Merge(ctx, bin, parts[0], parts[1], merged); err != nil {
+	repair := tracks[0].discontinuous || tracks[1].discontinuous
+	if err := ffmpeg.Merge(ctx, bin, parts[0], parts[1], merged, repair); err != nil {
 		return err
 	}
 	return os.Rename(merged, target)
+}
+
+// repairSingleTrack concatenates t's segments into a temp file, then asks
+// ffmpeg to regenerate its timestamps into target (ffmpeg.Repair): the one
+// case assembleStream otherwise never needs ffmpeg for at all (a single
+// track, concatenated as is), reached only when its playlist had an
+// EXT-X-DISCONTINUITY.
+func (d *Download) repairSingleTrack(ctx context.Context, bin, target, ext string, t *streamTrack) error {
+	joined := filepath.Join(d.workDir(), "joined"+ext)
+	f, err := os.Create(joined)
+	if err != nil {
+		return err
+	}
+	err = d.concat(ctx, f, 0, t)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	defer os.Remove(joined)
+	repaired := filepath.Join(d.workDir(), "repaired"+ext)
+	if err := ffmpeg.Repair(ctx, bin, joined, repaired); err != nil {
+		return err
+	}
+	return os.Rename(repaired, target)
 }
 
 // remuxTS joins an MPEG-TS track and remuxes it into the MP4 at target,
@@ -1267,7 +1312,7 @@ func (d *Download) remuxTS(ctx context.Context, target string, t *streamTrack) e
 			pw.CloseWithError(err)
 			joined <- err
 		}()
-		why = ffmpeg.RemuxTS(ctx, bin, pr, remuxed)
+		why = ffmpeg.RemuxTS(ctx, bin, pr, remuxed, t.discontinuous)
 		pr.CloseWithError(errors.New("ffmpeg stopped reading")) // unblocks concat
 		jerr := <-joined
 		if why == nil && jerr == nil {
