@@ -6,6 +6,24 @@ All notable changes to ODM are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- YouTube downloads: right-click a watch page → "Download with ODM". ODM
+  resolves the video itself first (no PO Token/BotGuard, no external
+  binary beyond Node.js for the rare video that needs its signature
+  solved), falling back to a configured `yt-dlp` for anything it can't —
+  a sign-in/age-gate wall, or a format that needs a PO Token. New Options →
+  Downloads settings: yt-dlp path (optional fallback) and Node.js path
+  (used by ODM's own extractor).
+- New Download window: a URL that is neither a direct file nor a
+  recognized stream manifest is now tried with a configured `yt-dlp`
+  before giving up, covering every site it supports (not just YouTube).
+- Extension: the "Download with ODM" button over a page's video now also
+  appears when the page has a visible `<video>` but nothing recognizable
+  was sniffed from the network (an encrypted or otherwise unrecognized
+  segment format, for instance); clicking it hands the page itself to the
+  New Download window, which tries it with the fallback above.
+
 ### Fixed
 
 - Extension: a download whose URL carries no file extension (Google
@@ -13,6 +31,14 @@ All notable changes to ODM are documented here. The format is based on
   missed when the browser has not yet resolved its suggested filename at
   the moment the download starts; the extension now holds it and waits
   briefly for that name before giving up.
+- yt-dlp downloads never showed progress: yt-dlp suppresses it entirely
+  when not writing to a real terminal, which is always true of the pipe
+  ODM reads it through; passing `--progress` forces it back on.
+- Extension: an Instagram/Facebook CDN video URL captured mid-playback
+  carried a `bytestart`/`byteend` byte range instead of the whole file,
+  so the download was a corrupt, unplayable fragment missing its
+  container header. Those parameters are stripped before the file is
+  fetched.
 
 ## [0.5.0] - 2026-10-19
 

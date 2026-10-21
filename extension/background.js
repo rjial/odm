@@ -122,11 +122,20 @@ function streamFormat(url, mime) {
 }
 
 // normalizeMediaURL drops the fragment, which the server never sees, so
-// the same file reached as v.mp4 and v.mp4#t=10 is listed once, and the
+// the same file reached as v.mp4 and v.mp4#t=10 is listed once; the
 // low-latency HLS reload parameters (_HLS_msn, _HLS_part, _HLS_skip, from
-// the HLS specification, RFC 8216bis): a player adds new ones on every
-// reload of the same playlist. Other query parameters are kept: no site's
-// parameters are special.
+// the HLS specification, RFC 8216bis), a player adds new ones on every
+// reload of the same playlist; and Instagram/Facebook CDN's own
+// "bytestart"/"byteend" progressive-download range params — a URL
+// captured mid-playback carries whatever byte range the player happened
+// to be fetching, not the whole file, and downloading it as-is produces a
+// truncated, unplayable file missing its container header. Confirmed
+// against a real captured URL that the CDN serves the complete file
+// (200, full Content-Length) once these are gone, and that they are not
+// part of its signature (its own "no-vary-search" response header lists
+// exactly which params affect the resource, and these are not in it).
+// Other query parameters are kept: no other site's parameters are
+// special.
 function normalizeMediaURL(url) {
   try {
     const u = new URL(url);
@@ -134,8 +143,9 @@ function normalizeMediaURL(url) {
     // Cut those pieces out of the raw query: URLSearchParams would write
     // every other parameter back re-encoded, which breaks signatures
     // computed over the query as it was.
-    if (u.search.includes("_HLS_")) {
-      const kept = u.search.slice(1).split("&").filter((p) => !p.startsWith("_HLS_"));
+    if (u.search.includes("_HLS_") || u.search.includes("bytestart=") || u.search.includes("byteend=")) {
+      const kept = u.search.slice(1).split("&").filter((p) =>
+        !p.startsWith("_HLS_") && !p.startsWith("bytestart=") && !p.startsWith("byteend="));
       u.search = kept.length ? "?" + kept.join("&") : "";
     }
     return u.toString();
@@ -435,6 +445,13 @@ function grab(item, referrer, title) {
   });
 }
 
+// grabPage hands off the page itself (see content.js's sendPage): ODM's
+// own New Download dialog probes it — direct file, stream manifest, then
+// yt-dlp — the same pipeline a typed address gets there.
+function grabPage(url, referrer, title) {
+  return handOff({ url, referrer, title });
+}
+
 // popupReferrer picks the referrer for an item sent from the popup, as
 // close as possible to the frame URL the in-page button would send: the
 // tab's URL for the top frame, else the frame's URL (Firefox) or origin
@@ -519,9 +536,23 @@ if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
       title: "Download with ODM",
       contexts: ["link", "video", "audio", "image"],
     });
+    // YouTube's player hides the actual media behind a protocol the
+    // sniffer below cannot read (see mediaKind), so there is no link or
+    // <video src> to right-click: offer the page itself, only there.
+    chrome.contextMenus.create({
+      id: "odm-download-page",
+      title: "Download with ODM",
+      contexts: ["page"],
+      documentUrlPatterns: ["*://*.youtube.com/watch*", "*://youtu.be/*"],
+    });
   });
 
   chrome.contextMenus.onClicked.addListener((info, tab) => {
+    if (info.menuItemId === "odm-download-page") {
+      const url = tab && tab.url;
+      if (url && /^https?:/.test(url)) handOff({ url, referrer: url, title: (tab && tab.title) || "" });
+      return;
+    }
     const url = info.linkUrl || info.srcUrl;
     if (url && /^https?:/.test(url)) {
       handOff({ url, referrer: info.pageUrl || "", title: (tab && tab.title) || "" });
@@ -623,6 +654,10 @@ if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
     }
     if (msg.type === "odm-grab" && msg.item) {
       grab(msg.item, sender.url || tab.url || "", tab.title || "").then(sendResponse);
+      return true;
+    }
+    if (msg.type === "odm-grab-page" && msg.url) {
+      grabPage(msg.url, sender.url || tab.url || "", msg.title || tab.title || "").then(sendResponse);
       return true;
     }
     if (msg.type === "odm-bypass" && msg.url) {

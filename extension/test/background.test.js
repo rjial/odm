@@ -126,6 +126,19 @@ test("normalizeMediaURL drops low-latency HLS reload parameters", () => {
   assert.equal(bg.normalizeMediaURL("https://cdn.example/l.m3u8?_HLS_msn=3"), "https://cdn.example/l.m3u8");
 });
 
+test("normalizeMediaURL drops Instagram/Facebook CDN's bytestart/byteend", () => {
+  // A URL captured mid-playback carries whatever chunk the player was
+  // fetching, not the whole file; the CDN serves the complete file once
+  // these are gone (confirmed against a real captured URL).
+  assert.equal(
+    bg.normalizeMediaURL("https://instagram.fcdn.net/v.mp4?oh=sig&bytestart=2032756&byteend=7498629&oe=exp"),
+    "https://instagram.fcdn.net/v.mp4?oh=sig&oe=exp");
+  assert.equal(bg.normalizeMediaURL("https://instagram.fcdn.net/v.mp4?bytestart=0&byteend=99"),
+    "https://instagram.fcdn.net/v.mp4");
+  // No range params: untouched.
+  assert.equal(bg.normalizeMediaURL("https://cdn.example/v.mp4?oh=sig"), "https://cdn.example/v.mp4?oh=sig");
+});
+
 test("mergeMedia keeps what a peek learned", () => {
   const first = { url: "u", kind: "stream", size: 0, at: 1, master: true, quality: "All qualities", live: true };
   const next = bg.mergeMedia([first], { url: "u", kind: "stream", size: 0, at: 5 });

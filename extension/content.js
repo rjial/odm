@@ -87,7 +87,8 @@
     });
     ui.dl.addEventListener("click", (e) => {
       e.stopPropagation();
-      if (items.length === 1) send(items[0]);
+      if (items.length === 0) sendPage();
+      else if (items.length === 1) send(items[0]);
       else toggleMenu();
     });
     // A click anywhere else closes the menu. Capture phase: player overlays
@@ -172,7 +173,23 @@
     });
   }
 
+  // sendPage hands off the page itself, not a sniffed media URL: the
+  // fallback for a visible <video> whose stream this content script never
+  // saw a recognizable network response for (an encrypted/obfuscated
+  // segment format, a site that renders into a blob: URL, …). ODM's own
+  // New Download dialog tries yt-dlp on it — the same fallback a typed
+  // address gets there, covering far more sites than this script's own
+  // sniffing ever could.
+  function sendPage() {
+    chrome.runtime.sendMessage({ type: "odm-grab-page", url: location.href, title: document.title }, (reply) => {
+      if (chrome.runtime.lastError || !reply) flash("ODM is not reachable", false);
+      else if (!reply.ok) flash(`ODM: ${reply.error}`, false);
+      else flash("Sent to ODM", true);
+    });
+  }
+
   function label() {
+    if (items.length === 0) return "Download this video";
     const files = items.filter((i) => i.kind === "file");
     const best = files.sort((a, b) => b.size - a.size)[0];
     if (!best) return "Download this video";
@@ -184,8 +201,12 @@
   let raf = 0;
   function place() {
     raf = 0;
-    if (dismissed || items.length === 0) return;
+    if (dismissed) return;
     const v = mainVideo();
+    // Nothing sniffed and no visible <video> either: nothing to offer.
+    // A visible <video> with no sniffed media is exactly the fallback
+    // case sendPage() exists for (see its own comment).
+    if (items.length === 0 && !v) return;
     if (!v) {
       if (host) host.style.display = "none";
       return;
