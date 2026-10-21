@@ -42,6 +42,9 @@ type Download struct {
 	Chunks  []*Chunk
 	// Stream is set for a segmented (HLS/DASH) download; see stream.go.
 	Stream *StreamJob
+	// YtDlp is set for a download handed to the yt-dlp fallback, when
+	// ODM's own YouTube extractor could not handle it; see youtube.go.
+	YtDlp *YtDlpJob
 	// TrustFrom, when set, replaces URL as the address localGuard judges
 	// (AddOptions.TrustFrom).
 	TrustFrom string
@@ -88,6 +91,9 @@ type Download struct {
 	// Segmented downloads: bytes on disk, and segments present / total.
 	streamDone             int64
 	streamHave, streamSegs int
+	// ytdlpDone is the yt-dlp fallback's progress, counted the same way
+	// streamDone is (see doneLocked).
+	ytdlpDone int64
 	// Live recordings: segments given up on, and whether fetching falls
 	// behind the stream (live.go checkPace).
 	streamSkipped int
@@ -259,6 +265,11 @@ func (d *Download) Start(parent context.Context) {
 
 	if d.Stream != nil {
 		d.runStream(ctx)
+		d.notify(true)
+		return
+	}
+	if d.YtDlp != nil {
+		d.runYtDlp(ctx)
 		d.notify(true)
 		return
 	}
@@ -1496,6 +1507,7 @@ type State struct {
 	Err          string            `json:"error,omitempty"`
 	Chunks       []*Chunk          `json:"chunks"`
 	Stream       *StreamJob        `json:"stream,omitempty"`
+	YtDlp        *YtDlpJob         `json:"ytdlp,omitempty"`
 	TrustFrom    string            `json:"trust_from,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
@@ -1518,6 +1530,11 @@ func (d *Download) State() State {
 		sj.Done = d.streamDone
 		stream = &sj
 	}
+	var ytdlp *YtDlpJob
+	if d.YtDlp != nil {
+		yj := *d.YtDlp
+		ytdlp = &yj
+	}
 	status := d.Status
 	if status == StatusDownloading {
 		status = StatusPaused
@@ -1529,7 +1546,7 @@ func (d *Download) State() State {
 		Queue: d.Queue, Description: d.Description, Order: d.Order,
 		Total: d.Total, RangeOK: d.RangeOK, ETag: d.ETag, LastModified: d.LastModified, Alone: d.alone,
 		Status: status, Err: d.Err,
-		Chunks: chunks, Stream: stream, TrustFrom: d.TrustFrom, CreatedAt: d.CreatedAt, UpdatedAt: time.Now(),
+		Chunks: chunks, Stream: stream, YtDlp: ytdlp, TrustFrom: d.TrustFrom, CreatedAt: d.CreatedAt, UpdatedAt: time.Now(),
 	}
 }
 
@@ -1558,12 +1575,16 @@ func Restore(s State, client *http.Client) *Download {
 	d.Order = s.Order
 	d.Chunks = s.Chunks
 	d.Stream = s.Stream
+	d.YtDlp = s.YtDlp
 	d.TrustFrom = s.TrustFrom
 	if s.Stream != nil {
 		d.streamDone = s.Stream.Done
 		if s.Status == StatusComplete {
 			d.streamDone = s.Total
 		}
+	}
+	if s.YtDlp != nil && s.Status == StatusComplete {
+		d.ytdlpDone = s.Total
 	}
 	d.Err = s.Err
 	d.CreatedAt = s.CreatedAt
@@ -1628,6 +1649,8 @@ func (d *Download) infoLocked() Info {
 	stream := ""
 	if d.Stream != nil {
 		stream = string(d.Stream.Kind)
+	} else if d.YtDlp != nil {
+		stream = "ytdlp"
 	}
 	return Info{
 		ID: d.ID, URL: d.URL, FinalURL: d.FinalURL, FileName: d.FileName, FilePath: path,
@@ -1650,7 +1673,7 @@ func (d *Download) doneBytes() int64 {
 }
 
 func (d *Download) doneLocked() int64 {
-	done := d.streamDone
+	done := d.streamDone + d.ytdlpDone
 	for _, c := range d.Chunks {
 		done += c.Done
 	}

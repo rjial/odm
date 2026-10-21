@@ -110,6 +110,19 @@ type Settings struct {
 	// streams that come as separate video and audio. Empty: look next to
 	// ODM, then on PATH.
 	FFmpegPath string `json:"ffmpeg_path,omitempty"`
+	// YtDlpPath points at yt-dlp (the program or its folder). When set up
+	// and working, it is used for every YouTube download (its quality
+	// ladder goes well past the single low-quality format ODM's own
+	// extractor can offer without a PO Token); that extractor only takes
+	// over when yt-dlp is missing or fails on a given video. Empty: look
+	// next to ODM, then on PATH. Entirely optional — without it, YouTube
+	// downloads just go through ODM's own extractor alone.
+	YtDlpPath string `json:"ytdlp_path,omitempty"`
+	// NodePath points at Node.js (the program or its folder), required by
+	// ODM's own YouTube extractor (the one used when yt-dlp above is not
+	// set up, or fails on a given video) to run yt-dlp/ejs's signature
+	// solver. Empty: look next to ODM, then on PATH.
+	NodePath string `json:"node_path,omitempty"`
 }
 
 // DefaultQueue is the queue used when none is specified.

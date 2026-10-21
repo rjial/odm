@@ -28,9 +28,12 @@ import (
 	"odm/internal/engine"
 	"odm/internal/ffmpeg"
 	"odm/internal/media"
+	"odm/internal/noderuntime"
 	"odm/internal/osutil"
 	"odm/internal/update"
 	"odm/internal/version"
+	"odm/internal/youtube"
+	"odm/internal/ytdlp"
 )
 
 func openPath(p string)   { _ = osutil.Open(p) }
@@ -122,6 +125,18 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 	//     picks the best quality when the download runs;
 	//   - streamErr: why it can never be downloaded (live, DRM), so Start
 	//     refuses instead of queueing something that will fail.
+	// ytFor/ytDirectURL/ytManifestURL/ytdlpChoices are the YouTube
+	// counterpart of the stream state above: a watch-page address (ytFor)
+	// resolves to exactly one of a plain file (ytDirectURL), a stream
+	// (ytManifestURL — the resolved address Stream.Job must use, not
+	// urlEntry's text) or the yt-dlp fallback (ytdlpChoices). All reset
+	// whenever the address changes.
+	var (
+		ytFor         string
+		ytDirectURL   string
+		ytManifestURL string
+		ytdlpChoices  *engine.YtDlpChoices
+	)
 	var (
 		stream     *engine.StreamChoices
 		streamKind media.Kind
@@ -134,8 +149,13 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 	audioSelect := widget.NewSelect(nil, nil)
 	fillAudio := func(q int) {
 		audioSelect.Options = nil
-		if stream != nil && q >= 0 && q < len(stream.Qualities) {
+		switch {
+		case stream != nil && q >= 0 && q < len(stream.Qualities):
 			for _, au := range stream.Qualities[q].Audios {
+				audioSelect.Options = append(audioSelect.Options, au.Label)
+			}
+		case ytdlpChoices != nil && q >= 0 && q < len(ytdlpChoices.Qualities):
+			for _, au := range ytdlpChoices.Qualities[q].Audios {
 				audioSelect.Options = append(audioSelect.Options, au.Label)
 			}
 		}
@@ -209,6 +229,7 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 	}
 	hideStream := func() {
 		stream, streamKind, streamErr, streamFor = nil, "", nil, ""
+		ytFor, ytDirectURL, ytManifestURL, ytdlpChoices = "", "", "", nil
 		if streamRows {
 			qualitySelect.Options = nil
 			qualitySelect.ClearSelected()
@@ -225,6 +246,29 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 			streamCat = ""
 		}
 	}
+	// showYtDlp mirrors showStream for the yt-dlp fallback's choices: the
+	// same Quality row, with Audio filled from that quality's own track
+	// list by fillAudio (every quality offers the same tracks — a
+	// YouTube video's audio doesn't depend on which height was picked).
+	showYtDlp := func(addr string, c *engine.YtDlpChoices) {
+		addStreamRows()
+		ytFor, ytdlpChoices = addr, c
+		setVideoCategory()
+		qualitySelect.Options = nil
+		for _, q := range c.Qualities {
+			label := q.Label
+			if q.Estimate > 0 {
+				label += " · ~" + humanBytes(q.Estimate)
+			}
+			qualitySelect.Options = append(qualitySelect.Options, label)
+		}
+		qualitySelect.Enable()
+		qualitySelect.SetSelectedIndex(0) // OnChanged fills the audio list
+		infoLabel.SetText("via yt-dlp")
+		if nameEntry.Text == "" {
+			nameEntry.SetText(engine.SanitizeName(c.Title + ".mp4"))
+		}
+	}
 
 	var probeTimer *time.Timer
 	urlEntry.OnChanged = func(s string) {
@@ -237,6 +281,47 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 			return
 		}
 		probeTimer = time.AfterFunc(600*time.Millisecond, func() {
+			if _, isYT := youtube.IsWatchURL(s); isYT {
+				// Longer than the plain-file/stream probe below: this chains
+				// a watch-page fetch, one or more Innertube requests and,
+				// when a challenge needs solving, a Node.js run.
+				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				defer cancel()
+				yp, err := a.mgr.ProbeYouTube(ctx, s)
+				fyne.Do(func() {
+					if urlEntry.Text != s {
+						return // the address changed while this probe ran
+					}
+					if err != nil {
+						infoLabel.SetText(err.Error())
+						return
+					}
+					switch {
+					case yp.DirectURL != "":
+						ytFor, ytDirectURL = s, yp.DirectURL
+						info := dash(humanBytes(yp.File.Total))
+						if yp.File.ContentType != "" {
+							info += " · " + yp.File.ContentType
+						}
+						infoLabel.SetText(info)
+						if nameEntry.Text == "" {
+							name := yp.Title
+							if yp.Ext != "" {
+								name += "." + yp.Ext
+							}
+							nameEntry.SetText(engine.SanitizeName(name))
+							catSelect.SetSelected(engine.Category(name))
+						}
+					case yp.Stream != nil:
+						ytFor, ytManifestURL = s, yp.ManifestURL
+						showStream(s, yp.Stream.Kind, yp.Stream, nil)
+					case yp.YtDlp != nil:
+						showYtDlp(s, yp.YtDlp)
+					}
+				})
+				return
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			// The browser already knows a playlist when it sends one; a
@@ -263,6 +348,17 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 					kind = choices.Kind // the playlist itself is the better judge
 				}
 			}
+			// Neither a direct file nor a stream manifest ODM recognizes on
+			// its own: yt-dlp supports far more sites than that, so it gets
+			// one last try (its own, separate timeout — extraction can be
+			// slow, and this only runs after the probe above already
+			// finished) before the address is reported as unsupported.
+			var ytdlpFallback *engine.YtDlpChoices
+			if kind == "" && err != nil {
+				ytCtx, ytCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				ytdlpFallback, _ = a.mgr.ProbeYtDlp(ytCtx, s)
+				ytCancel()
+			}
 			fyne.Do(func() {
 				if urlEntry.Text != s {
 					return // the address changed while this probe ran
@@ -276,6 +372,10 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 					// A typed address that only looked like a stream (an
 					// .m3u music list, say) is downloaded as the file it is.
 					infoLabel.SetText(err.Error() + " · downloads as a file")
+					return
+				}
+				if ytdlpFallback != nil {
+					showYtDlp(s, ytdlpFallback)
 					return
 				}
 				if err != nil {
@@ -335,7 +435,26 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 			return
 		}
 		var job *engine.StreamJob
+		var ytdlpJob *engine.YtDlpJob
 		switch {
+		case ytFor == url && ytDirectURL != "":
+			// A plain file ODM's own YouTube extractor resolved: downloads
+			// exactly like any other file, from the resolved address.
+			url = ytDirectURL
+		case ytFor == url && ytManifestURL != "":
+			j, err := stream.Job(ytManifestURL, qualitySelect.SelectedIndex(), audioSelect.SelectedIndex())
+			if err != nil {
+				dialog.ShowError(err, parent)
+				return
+			}
+			job = &j
+		case ytFor == url && ytdlpChoices != nil:
+			j, err := ytdlpChoices.Job(url, qualitySelect.SelectedIndex(), audioSelect.SelectedIndex())
+			if err != nil {
+				dialog.ShowError(err, parent)
+				return
+			}
+			ytdlpJob = &j
 		case streamFor == url && streamErr != nil:
 			dialog.ShowError(streamErr, parent)
 			return
@@ -361,6 +480,7 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 		}
 		info := a.mgr.Create(engine.AddOptions{
 			Stream:      job,
+			YtDlp:       ytdlpJob,
 			URL:         url,
 			Dir:         strings.TrimSpace(folderEntry.Text),
 			FileName:    engine.SanitizeName(nameEntry.Text),
@@ -655,6 +775,76 @@ func (a *application) openOptionsTab(tab int) {
 		}, w).Show()
 	})
 	checkFFmpeg(0)
+	// yt-dlp, when set up and working, is used for every YouTube
+	// download (its quality ladder goes well past the single low-quality
+	// format ODM's own extractor can offer without a PO Token). Entirely
+	// optional: without it, YouTube downloads go through ODM's own
+	// extractor alone.
+	ytdlpEntry := widget.NewEntry()
+	ytdlpEntry.SetText(settings.YtDlpPath)
+	ytdlpEntry.SetPlaceHolder("Found automatically")
+	ytdlpStatusLabel := hint("")
+	var ytdlpGen int
+	var ytdlpTimer *time.Timer
+	checkYtDlp := func(delay time.Duration) {
+		ytdlpGen++
+		gen, typed := ytdlpGen, ytdlpEntry.Text
+		if ytdlpTimer != nil {
+			ytdlpTimer.Stop()
+		}
+		ytdlpTimer = time.AfterFunc(delay, func() {
+			msg := ytdlpStatus(typed)
+			fyne.Do(func() {
+				if gen == ytdlpGen {
+					ytdlpStatusLabel.SetText(msg)
+				}
+			})
+		})
+	}
+	ytdlpEntry.OnChanged = func(string) { checkYtDlp(600 * time.Millisecond) }
+	ytdlpBrowse := widget.NewButtonWithIcon("Browse", theme.FolderOpenIcon(), func() {
+		dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err == nil && r != nil {
+				_ = r.Close()
+				ytdlpEntry.SetText(r.URI().Path())
+			}
+		}, w).Show()
+	})
+	checkYtDlp(0)
+	// Node.js runs the same signature solver yt-dlp itself does, needed by
+	// ODM's own YouTube extractor. Without it, a YouTube download that
+	// needs solving falls to yt-dlp above, if set up.
+	nodeEntry := widget.NewEntry()
+	nodeEntry.SetText(settings.NodePath)
+	nodeEntry.SetPlaceHolder("Found automatically")
+	nodeStatusLabel := hint("")
+	var nodeGen int
+	var nodeTimer *time.Timer
+	checkNode := func(delay time.Duration) {
+		nodeGen++
+		gen, typed := nodeGen, nodeEntry.Text
+		if nodeTimer != nil {
+			nodeTimer.Stop()
+		}
+		nodeTimer = time.AfterFunc(delay, func() {
+			msg := nodeStatus(typed)
+			fyne.Do(func() {
+				if gen == nodeGen {
+					nodeStatusLabel.SetText(msg)
+				}
+			})
+		})
+	}
+	nodeEntry.OnChanged = func(string) { checkNode(600 * time.Millisecond) }
+	nodeBrowse := widget.NewButtonWithIcon("Browse", theme.FolderOpenIcon(), func() {
+		dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err == nil && r != nil {
+				_ = r.Close()
+				nodeEntry.SetText(r.URI().Path())
+			}
+		}, w).Show()
+	})
+	checkNode(0)
 	downloadsTab := container.NewVBox(
 		header("Default download settings"),
 		startCheck,
@@ -676,6 +866,14 @@ func (a *application) openOptionsTab(tab int) {
 		widget.NewLabel("ffmpeg (joins the video and audio of some streams):"),
 		container.NewBorder(nil, nil, nil, ffBrowse, ffEntry),
 		ffStatus,
+		widget.NewSeparator(),
+		widget.NewLabel("yt-dlp (used for every YouTube download when set up and working):"),
+		container.NewBorder(nil, nil, nil, ytdlpBrowse, ytdlpEntry),
+		ytdlpStatusLabel,
+		widget.NewSeparator(),
+		widget.NewLabel("Node.js (needed for ODM's own YouTube support, used when yt-dlp above is not):"),
+		container.NewBorder(nil, nil, nil, nodeBrowse, nodeEntry),
+		nodeStatusLabel,
 	)
 
 	// Connection
@@ -1010,6 +1208,8 @@ func (a *application) openOptionsTab(tab int) {
 		next.HostConnections = hostMap
 		next.UserAgent = strings.TrimSpace(uaEntry.Text)
 		next.FFmpegPath = strings.TrimSpace(ffEntry.Text)
+		next.YtDlpPath = strings.TrimSpace(ytdlpEntry.Text)
+		next.NodePath = strings.TrimSpace(nodeEntry.Text)
 		next.DuplicateAuto = engine.DuplicateSkip
 		if dupSelect.Selected == dupAgain {
 			next.DuplicateAuto = engine.DuplicateAgain
@@ -1065,6 +1265,50 @@ func ffmpegStatus(typed string) string {
 		v = "unknown version"
 	}
 	return "Using " + bin + " (" + v + ")"
+}
+
+// ytdlpStatus describes the yt-dlp that the typed path (empty: the
+// automatic search) leads to, with its version. yt-dlp is optional, so a
+// missing one is not phrased as sternly as ffmpeg's.
+func ytdlpStatus(typed string) string {
+	bin, err := ytdlp.Locate(typed)
+	if err != nil {
+		if strings.TrimSpace(typed) == "" {
+			return "Not found. Used for every YouTube download when present — its quality ladder " +
+				"goes well past the single low-quality format ODM's own extractor can offer on its own; " +
+				"put yt-dlp next to ODM, add it to PATH, or choose it here."
+		}
+		return "No yt-dlp at this path. Leave it empty to search next to ODM and on PATH."
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	v, err := ytdlp.Version(ctx, bin)
+	if err != nil {
+		return "Found " + bin + ", but it did not run: " + err.Error()
+	}
+	return "Using " + bin + " (" + strings.TrimSpace(v) + ")"
+}
+
+// nodeStatus describes the Node.js that the typed path (empty: the
+// automatic search) leads to, with its version. Needed for ODM's own
+// YouTube extractor, which is only used when yt-dlp above is missing or
+// fails on a given video.
+func nodeStatus(typed string) string {
+	bin, err := noderuntime.Locate(typed)
+	if err != nil {
+		if strings.TrimSpace(typed) == "" {
+			return "Not found. Needed for ODM's own YouTube support, used when yt-dlp above " +
+				"is not set up (or fails on a given video) — put Node.js next to ODM, add it to PATH, or choose it here."
+		}
+		return "No Node.js at this path. Leave it empty to search next to ODM and on PATH."
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	v, err := noderuntime.Version(ctx, bin)
+	if err != nil {
+		return "Found " + bin + ", but it did not run: " + err.Error()
+	}
+	return "Using " + bin + " (" + strings.TrimSpace(v) + ")"
 }
 
 // parseFileTypes turns "torrent, .SRT nupkg" into ["torrent" "srt" "nupkg"].
@@ -1698,12 +1942,15 @@ func (a *application) updateProgressWindow(id string) {
 	} else if d.Total > 0 {
 		v.bar.SetValue(d.Progress / 100)
 	}
-	if d.Stream != "" {
+	if d.Stream == "hls" || d.Stream == "dash" {
 		// A stream has no byte ranges or connections to map: its pieces
 		// are segments, fetched a few at a time in any order. The strip
 		// becomes one bar of segments done, and the empty table goes.
 		// The counts are not saved, so after a restart a finished stream
 		// has none; it is shown whole rather than as "-".
+		// (The yt-dlp fallback, Stream == "ytdlp", has no segments of its
+		// own to show either — it falls to the plain-file branch below,
+		// same as it has no Chunks: nothing to map, but not mislabeled.)
 		segs, have := d.Segments, d.SegmentsDone
 		text := segmentsText(d)
 		if segs == 0 && d.Status == engine.StatusComplete {

@@ -30,6 +30,10 @@ func hostDirs() []hostDir {
 		{"Chrome", j(".config", "google-chrome"), j(".config", "google-chrome", "NativeMessagingHosts"), "chromium"},
 		{"Chromium", j(".config", "chromium"), j(".config", "chromium", "NativeMessagingHosts"), "chromium"},
 		{"Edge", j(".config", "microsoft-edge"), j(".config", "microsoft-edge", "NativeMessagingHosts"), "chromium"},
+		// Helium (https://helium.computer): its profile directory is
+		// "net.imput.helium", confirmed on a real install; its macOS/Windows
+		// equivalents are not, so only this one is added for now.
+		{"Helium", j(".config", "net.imput.helium"), j(".config", "net.imput.helium", "NativeMessagingHosts"), "chromium"},
 		{"Firefox", j(".mozilla"), j(".mozilla", "native-messaging-hosts"), "firefox"},
 	}
 }

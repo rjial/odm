@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"odm/internal/osutil"
+	"odm/internal/youtube"
 )
 
 // Manager owns every download, the concurrency limit, settings and persistence.
@@ -68,6 +69,7 @@ func NewManager(settings Settings, settingsPath string) *Manager {
 	settings.normalize(settings.Dir)
 	setUserAgent(settings.UserAgent)
 	setFFmpegPath(settings.FFmpegPath)
+	setYtDlpPath(settings.YtDlpPath)
 	return &Manager{
 		downloads: map[string]*Download{},
 		running:   map[string]bool{},
@@ -311,6 +313,7 @@ func (m *Manager) UpdateSettings(next Settings) Settings {
 	m.limiter.SetRate(next.SpeedLimit)
 	setUserAgent(next.UserAgent)
 	setFFmpegPath(next.FFmpegPath)
+	setYtDlpPath(next.YtDlpPath)
 	if path != "" {
 		_ = SaveSettings(path, next)
 	}
@@ -645,6 +648,10 @@ type AddOptions struct {
 	// Stream makes this a segmented (HLS/DASH) download; URL is then the
 	// manifest the stream was found at.
 	Stream *StreamJob
+	// YtDlp makes this a download handed to the yt-dlp fallback; URL is
+	// then the original watch-page (or other) address, which yt-dlp
+	// resolves itself.
+	YtDlp *YtDlpJob
 	// TrustFrom is the address that decides whether this download may
 	// reach the local network (see localGuard), when that is not URL
 	// itself: the page a crawl started from, for the files it found.
@@ -680,6 +687,10 @@ func (m *Manager) Create(o AddOptions) Info {
 	if o.Stream != nil {
 		sj := *o.Stream
 		d.Stream = &sj
+	}
+	if o.YtDlp != nil {
+		yj := *o.YtDlp
+		d.YtDlp = &yj
 	}
 	d.SetCategoryDirs(st.CategoryDirs)
 	d.SetLimiter(m.limiter)
@@ -762,6 +773,39 @@ func (m *Manager) AddAuto(o AddOptions) (info Info, added bool) {
 	if m.Settings().DuplicateAuto != DuplicateAgain {
 		if existing, ok := m.FindByURL(o.URL); ok {
 			return existing, false
+		}
+	}
+	// A YouTube URL added with no New Download window to probe it (the
+	// browser's "skip the dialog" setting, the API, the clipboard monitor)
+	// would otherwise be downloaded as the plain watch-page HTML: resolve
+	// it the same way the window's probe would, here instead.
+	if o.Stream == nil && o.YtDlp == nil {
+		if _, ok := youtube.IsWatchURL(o.URL); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), youtubeAutoProbeTimeout)
+			yp, err := m.ProbeYouTube(ctx, o.URL)
+			cancel()
+			if err == nil {
+				switch {
+				case yp.DirectURL != "":
+					o.URL = yp.DirectURL
+					if o.FileName == "" {
+						o.FileName = SanitizeName(yp.Title + "." + yp.Ext)
+					}
+				case yp.Stream != nil:
+					j, jerr := yp.Stream.Job(yp.ManifestURL, 0, 0)
+					if jerr == nil {
+						o.Stream = &j
+					}
+				case yp.YtDlp != nil:
+					j, jerr := yp.YtDlp.Job(o.URL, 0, 0) // best quality, best audio: no dialog to ask in
+					if jerr == nil {
+						o.YtDlp = &j
+						if o.FileName == "" {
+							o.FileName = SanitizeName(yp.YtDlp.Title + ".mp4")
+						}
+					}
+				}
+			}
 		}
 	}
 	return m.Create(o), true

@@ -74,6 +74,10 @@ Keep ODM running, then:
   window then lists its qualities and audio tracks (with that window turned
   off, ODM picks the best quality itself).
 - **Right-click** a link, video, audio or image → **Download with ODM**.
+- **Right-click a YouTube watch page** (anywhere, not on a specific
+  element) → **Download with ODM**. YouTube's player hides the actual
+  video behind a protocol the usual sniffing can't read, so this is a
+  separate menu entry, page-wide, shown only there.
 - **Toolbar popup:** the icon's badge counts the media the page has loaded
   (up to 15, from every frame), and the popup lists them with how long ago
   each was seen. Use it when there is no button: audio-only pages, players

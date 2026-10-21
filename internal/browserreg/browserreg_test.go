@@ -84,15 +84,16 @@ func TestRegisterUnixFolders(t *testing.T) {
 	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	_ = os.MkdirAll(filepath.Join(home, ".config", "google-chrome"), 0o755) // Chrome installed
-	_ = os.MkdirAll(filepath.Join(home, ".mozilla"), 0o755)                 // Firefox installed
+	_ = os.MkdirAll(filepath.Join(home, ".config", "google-chrome"), 0o755)    // Chrome installed
+	_ = os.MkdirAll(filepath.Join(home, ".mozilla"), 0o755)                    // Firefox installed
+	_ = os.MkdirAll(filepath.Join(home, ".config", "net.imput.helium"), 0o755) // Helium installed
 
 	res := Register("/opt/odm/odm", filepath.Join(home, ".config", "odm"))
 	got := map[string]Result{}
 	for _, r := range res {
 		got[r.Browser] = r
 	}
-	for _, b := range []string{"Chrome", "Firefox"} {
+	for _, b := range []string{"Chrome", "Firefox", "Helium"} {
 		if got[b].Err != nil || got[b].Skipped {
 			t.Fatalf("%s: %+v", b, got[b])
 		}
@@ -112,7 +113,7 @@ func TestRegisterUnixFolders(t *testing.T) {
 	for _, s := range Check() {
 		status[s.Browser] = s
 	}
-	if !status["Chrome"].Points("/opt/odm/odm") || !status["Firefox"].Points("/opt/odm/odm") {
+	if !status["Chrome"].Points("/opt/odm/odm") || !status["Firefox"].Points("/opt/odm/odm") || !status["Helium"].Points("/opt/odm/odm") {
 		t.Fatalf("Check after Register: %+v", status)
 	}
 	if status["Chrome"].Points("/other/odm") {
