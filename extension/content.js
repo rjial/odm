@@ -11,16 +11,53 @@
   let dismissed = false;
   let host = null;
   let ui = null;
+  // singleURL, when set, overrides items/menu entirely: ui.dl hands this
+  // one URL off directly instead. Set by placeSingle, cleared by
+  // placeMain — see place()'s own comment for why.
+  let singleURL = null;
   // medialist.js runs first in the same content-script world.
   const { fmtSize, orderMedia, mediaRow, ROW_CSS, ICONS } = self.odmMediaList;
 
-  // The largest visible video is the player; small ones are previews.
-  function mainVideo() {
-    let best = null;
-    let bestArea = 0;
+  // qualifyingVideos lists every on-screen video big enough to be a
+  // player rather than a preview thumbnail. A vertical reels-style feed
+  // (Instagram's, TikTok's) keeps the next/previous item's <video>
+  // mounted just off-screen for a smooth scroll, with real dimensions
+  // too, so an actual viewport check (not just width/height) is what
+  // keeps those from counting.
+  function qualifyingVideos() {
+    const list = [];
     for (const v of document.querySelectorAll("video")) {
       const r = v.getBoundingClientRect();
       if (r.width < MIN_W || r.height < MIN_H) continue;
+      if (r.bottom <= 0 || r.top >= window.innerHeight || r.right <= 0 || r.left >= window.innerWidth) continue;
+      list.push(v);
+    }
+    return list;
+  }
+
+  // currentPermalink reports the current URL when it already names one
+  // specific reel/post, not a feed or grid of several — Instagram pushes
+  // a per-item address via the History API as a reels feed is scrolled,
+  // even though (per qualifyingVideos' own comment) the DOM still holds
+  // the next/previous item's elements too. Far more reliable than
+  // hunting the DOM for a link: a reel's own info panel links to things
+  // like its audio track (.../reels/audio/<id>/), which can otherwise be
+  // mistaken for a second reel's permalink (nearestPostURL's own anchored
+  // pattern guards the same way, for the sites it does have to search).
+  function currentPermalink() {
+    return /^\/(p|reel|reels|tv)\/[^/]+\/?$/.test(location.pathname) ? location.href : null;
+  }
+
+  // The largest visible video is the player; small ones are previews.
+  // Used only once sniffed media narrows things to one player per page
+  // (true of every site this was built against); a feed or grid page with
+  // several videos at once and nothing sniffed uses qualifyingVideos
+  // instead, one button each — see placeFallbacks.
+  function mainVideo() {
+    let best = null;
+    let bestArea = 0;
+    for (const v of qualifyingVideos()) {
+      const r = v.getBoundingClientRect();
       const area = r.width * r.height;
       if (area > bestArea) {
         best = v;
@@ -28,6 +65,33 @@
       }
     }
     return best;
+  }
+
+  // nearestPostURL finds a video's own permalink by walking up to the
+  // closest wrapping link, for a feed/grid page with several videos at
+  // once and no specific one already named by the URL (a profile's own
+  // grid of posts, say — currentPermalink is checked first and covers
+  // the reels-feed case): the page's own URL is the same for every video
+  // on it there, so handing that off no matter which button was clicked
+  // would always resolve the same one post. "/p/", "/reel/" and "/tv/"
+  // are Instagram's own permalink shapes; the pattern is anchored to
+  // exactly two path segments so a post's own links to other things
+  // (its audio track, at .../reels/audio/<id>/) are not mistaken for a
+  // second post's permalink. Falling back to the page URL (handled by
+  // the caller) is no worse than today's single-video behavior for a
+  // site this heuristic misses.
+  function nearestPostURL(video) {
+    let el = video;
+    while (el && el !== document.body) {
+      if (el.tagName === "A" && el.getAttribute("href")) {
+        try {
+          const u = new URL(el.href, location.href);
+          if (/^\/(p|reel|reels|tv)\/[^/]+\/?$/.test(u.pathname)) return u.href;
+        } catch { /* not a parseable href */ }
+      }
+      el = el.parentElement;
+    }
+    return null;
   }
 
   // The button lives in a closed shadow root so the page's CSS cannot
@@ -87,8 +151,16 @@
     });
     ui.dl.addEventListener("click", (e) => {
       e.stopPropagation();
-      if (items.length === 0) sendPage();
-      else if (items.length === 1) send(items[0]);
+      if (singleURL) {
+        const url = singleURL;
+        chrome.runtime.sendMessage({ type: "odm-grab-page", url, title: document.title }, (reply) => {
+          if (chrome.runtime.lastError || !reply) flash("ODM is not reachable", false);
+          else if (!reply.ok) flash(`ODM: ${reply.error}`, false);
+          else flash("Sent to ODM", true);
+        });
+        return;
+      }
+      if (items.length === 1) send(items[0]);
       else toggleMenu();
     });
     // A click anywhere else closes the menu. Capture phase: player overlays
@@ -173,23 +245,7 @@
     });
   }
 
-  // sendPage hands off the page itself, not a sniffed media URL: the
-  // fallback for a visible <video> whose stream this content script never
-  // saw a recognizable network response for (an encrypted/obfuscated
-  // segment format, a site that renders into a blob: URL, …). ODM's own
-  // New Download dialog tries yt-dlp on it — the same fallback a typed
-  // address gets there, covering far more sites than this script's own
-  // sniffing ever could.
-  function sendPage() {
-    chrome.runtime.sendMessage({ type: "odm-grab-page", url: location.href, title: document.title }, (reply) => {
-      if (chrome.runtime.lastError || !reply) flash("ODM is not reachable", false);
-      else if (!reply.ok) flash(`ODM: ${reply.error}`, false);
-      else flash("Sent to ODM", true);
-    });
-  }
-
   function label() {
-    if (items.length === 0) return "Download this video";
     const files = items.filter((i) => i.kind === "file");
     const best = files.sort((a, b) => b.size - a.size)[0];
     if (!best) return "Download this video";
@@ -198,15 +254,9 @@
 
   // Keeps the button at the video's top-right corner as the page scrolls,
   // resizes or swaps players.
-  let raf = 0;
-  function place() {
-    raf = 0;
-    if (dismissed) return;
+  function placeMain() {
+    singleURL = null;
     const v = mainVideo();
-    // Nothing sniffed and no visible <video> either: nothing to offer.
-    // A visible <video> with no sniffed media is exactly the fallback
-    // case sendPage() exists for (see its own comment).
-    if (items.length === 0 && !v) return;
     if (!v) {
       if (host) host.style.display = "none";
       return;
@@ -218,6 +268,120 @@
     const w = host.getBoundingClientRect().width || 220;
     host.style.top = `${window.scrollY + r.top + 8}px`;
     host.style.left = `${window.scrollX + Math.max(r.left, r.right - w - 8)}px`;
+  }
+
+  // placeSingle offers one confident button for a page whose own URL
+  // already names one specific reel/post (currentPermalink), ignoring
+  // items/the menu entirely: a reels-style feed preloads several items'
+  // media at once, often faster than any per-navigation reset of the
+  // sniffed list can clear it (see currentPermalink's own comment), so
+  // that list can hold more than just the one actually in view with no
+  // reliable way to tell which is which — the URL alone is trustworthy.
+  function placeSingle(url) {
+    singleURL = url;
+    const v = mainVideo();
+    if (!v) {
+      if (host) host.style.display = "none";
+      return;
+    }
+    if (!host) build();
+    host.style.display = "";
+    ui.dlText.textContent = "Download this video";
+    const r = v.getBoundingClientRect();
+    const w = host.getBoundingClientRect().width || 220;
+    host.style.top = `${window.scrollY + r.top + 8}px`;
+    host.style.left = `${window.scrollX + Math.max(r.left, r.right - w - 8)}px`;
+  }
+
+  // fallbacks holds one tiny button per qualifying video for the "nothing
+  // sniffed" case: a feed or grid page (Instagram's, for instance) can
+  // have several of those at once, each needing its own, unlike the one
+  // main player placeMain positions a single button over.
+  const fallbacks = new Map(); // video element -> { host, txt }
+
+  function buildFallback(video) {
+    const fhost = document.createElement("div");
+    fhost.style.cssText = "position:absolute;z-index:2147483647;top:0;left:0;";
+    const root = fhost.attachShadow({ mode: "closed" });
+    root.innerHTML = `
+      <style>
+        :host { all: initial; }
+        button { all: unset; box-sizing: border-box; cursor: pointer; height: 32px; border-radius: 8px;
+          display: inline-flex; align-items: center; gap: 7px; padding: 0 13px 0 11px;
+          background: #1f6feb; color: #fff; font-weight: 600; white-space: nowrap;
+          font: 13px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+          box-shadow: 0 2px 10px rgba(0, 0, 0, .45); }
+        button:hover { background: #388bfd; }
+        button:focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+        svg { width: 16px; height: 16px; }
+      </style>
+      <button type="button"><span class="ico">${ICONS.download}</span><span class="txt">Download this video</span></button>`;
+    const button = root.querySelector("button");
+    const txt = root.querySelector(".txt");
+    let flashTimer = 0;
+    button.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const url = currentPermalink() || nearestPostURL(video) || location.href;
+      chrome.runtime.sendMessage({ type: "odm-grab-page", url, title: document.title }, (reply) => {
+        const ok = !chrome.runtime.lastError && reply && reply.ok;
+        txt.textContent = ok ? "Sent to ODM" : "ODM is not reachable";
+        clearTimeout(flashTimer);
+        flashTimer = setTimeout(() => (txt.textContent = "Download this video"), 2500);
+      });
+    });
+    document.documentElement.appendChild(fhost);
+    return { host: fhost, txt };
+  }
+
+  function placeFallbacks() {
+    const current = new Set(qualifyingVideos());
+    for (const v of current) {
+      let entry = fallbacks.get(v);
+      if (!entry) {
+        entry = buildFallback(v);
+        fallbacks.set(v, entry);
+      }
+      const r = v.getBoundingClientRect();
+      const w = entry.host.getBoundingClientRect().width || 220;
+      entry.host.style.display = "";
+      entry.host.style.top = `${window.scrollY + r.top + 8}px`;
+      entry.host.style.left = `${window.scrollX + Math.max(r.left, r.right - w - 8)}px`;
+    }
+    for (const [v, entry] of fallbacks) {
+      if (!current.has(v)) {
+        entry.host.remove();
+        fallbacks.delete(v);
+      }
+    }
+  }
+
+  function removeFallbacks() {
+    for (const [, entry] of fallbacks) entry.host.remove();
+    fallbacks.clear();
+  }
+
+  let raf = 0;
+  function place() {
+    raf = 0;
+    if (dismissed) {
+      removeFallbacks();
+      return;
+    }
+    // A specific reel/post's own URL beats any sniffed media list — see
+    // placeSingle's own comment for why.
+    const permalink = currentPermalink();
+    if (permalink) {
+      removeFallbacks();
+      placeSingle(permalink);
+      return;
+    }
+    if (items.length > 0) {
+      removeFallbacks();
+      placeMain();
+      return;
+    }
+    if (host) host.style.display = "none";
+    placeFallbacks();
   }
   const schedule = () => {
     if (!raf) raf = requestAnimationFrame(place);
