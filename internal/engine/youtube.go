@@ -40,6 +40,14 @@ type YtDlpJob struct {
 	Format   string `json:"format"`          // yt-dlp -f selector
 	Title    string `json:"title,omitempty"` // used to name the file
 	Estimate int64  `json:"estimate,omitempty"`
+	// EmbedThumbnail/EmbedMetadata ask yt-dlp to mux the thumbnail
+	// (cover art) and title/artist tags into an audio-only download,
+	// independently (--embed-thumbnail, --embed-metadata); both need
+	// ffmpeg, so runYtDlp only honours them when ffmpeg is also
+	// configured. Meaningless for a video download; the New Download
+	// window only ever offers these checkboxes for "Audio only".
+	EmbedThumbnail bool `json:"embed_thumbnail,omitempty"`
+	EmbedMetadata  bool `json:"embed_metadata,omitempty"`
 }
 
 // YtDlpAudio is one audio track the yt-dlp fallback offers, mirroring
@@ -275,6 +283,12 @@ func (d *Download) runYtDlp(ctx context.Context) {
 	args := []string{"-f", job.Format, "--no-playlist", "--merge-output-format", "mp4"}
 	if ffBin, ffErr := ffmpeg.Locate(ffmpegConfigured()); ffErr == nil {
 		args = append(args, "--ffmpeg-location", filepath.Dir(ffBin))
+		if job.EmbedThumbnail {
+			args = append(args, "--embed-thumbnail")
+		}
+		if job.EmbedMetadata {
+			args = append(args, "--embed-metadata")
+		}
 	}
 	args = append(args, "-o", ytdlpWorkTemplate(dir, id), job.URL)
 

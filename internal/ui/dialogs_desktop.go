@@ -147,6 +147,28 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 	)
 	qualitySelect := widget.NewSelect(nil, nil)
 	audioSelect := widget.NewSelect(nil, nil)
+	// embedThumbCheck/embedMetaCheck are yt-dlp's own --embed-thumbnail
+	// and --embed-metadata, offered only for its "Audio only" quality
+	// (Height 0): cover art and title/artist tags are an audio-file
+	// convention, not a video one. Needs ffmpeg, same as the merge every
+	// other yt-dlp download already does, so both are hidden entirely
+	// when none is configured. Each remembers its own choice across
+	// downloads (Settings.YtDlpNoEmbed*), saved as soon as it changes —
+	// this window has no separate "Save" step of its own.
+	embedThumbCheck := widget.NewCheck("Embed thumbnail", func(b bool) {
+		next := a.mgr.Settings()
+		next.YtDlpNoEmbedThumbnail = !b
+		a.mgr.UpdateSettings(next)
+	})
+	embedMetaCheck := widget.NewCheck("Embed metadata", func(b bool) {
+		next := a.mgr.Settings()
+		next.YtDlpNoEmbedMetadata = !b
+		a.mgr.UpdateSettings(next)
+	})
+	embedThumbCheck.SetChecked(!settings.YtDlpNoEmbedThumbnail)
+	embedMetaCheck.SetChecked(!settings.YtDlpNoEmbedMetadata)
+	embedThumbCheck.Hide()
+	embedMetaCheck.Hide()
 	fillAudio := func(q int) {
 		audioSelect.Options = nil
 		switch {
@@ -168,6 +190,15 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 		} else {
 			audioSelect.Disable()
 		}
+		audioOnly := ytdlpChoices != nil && q >= 0 && q < len(ytdlpChoices.Qualities) && ytdlpChoices.Qualities[q].Height == 0
+		_, ffErr := ffmpeg.Locate(settings.FFmpegPath)
+		if audioOnly && ffErr == nil {
+			embedThumbCheck.Show()
+			embedMetaCheck.Show()
+		} else {
+			embedThumbCheck.Hide()
+			embedMetaCheck.Hide()
+		}
 	}
 	qualitySelect.OnChanged = func(string) { fillAudio(qualitySelect.SelectedIndex()) }
 
@@ -179,6 +210,7 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 		streamRows = true
 		form.Append("Quality", qualitySelect)
 		form.Append("Audio", audioSelect)
+		form.Append("", container.NewHBox(embedThumbCheck, embedMetaCheck))
 		if relayout != nil {
 			relayout()
 		}
@@ -238,6 +270,8 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 			audioSelect.Options = nil
 			audioSelect.ClearSelected()
 			audioSelect.Disable()
+			embedThumbCheck.Hide()
+			embedMetaCheck.Hide()
 		}
 		if streamCat != "" {
 			if catSelect.Selected == "Video" { // not changed by hand since
@@ -353,10 +387,17 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 			// one last try (its own, separate timeout — extraction can be
 			// slow, and this only runs after the probe above already
 			// finished) before the address is reported as unsupported.
+			// A page address (Instagram's reel/post permalinks, YouTube
+			// watch pages typed by hand, …) usually still "succeeds" as a
+			// probe — the server answers 200 with the page's own HTML, not
+			// an error — so text/html is treated the same as a failed
+			// probe here, not as a real, if oddly-reported, file.
+			isHTML := err == nil && p != nil && strings.HasPrefix(strings.ToLower(p.ContentType), "text/html")
 			var ytdlpFallback *engine.YtDlpChoices
-			if kind == "" && err != nil {
+			var ytdlpErr error
+			if kind == "" && (err != nil || isHTML) {
 				ytCtx, ytCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				ytdlpFallback, _ = a.mgr.ProbeYtDlp(ytCtx, s)
+				ytdlpFallback, ytdlpErr = a.mgr.ProbeYtDlp(ytCtx, s)
 				ytCancel()
 			}
 			fyne.Do(func() {
@@ -380,6 +421,14 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 				}
 				if err != nil {
 					infoLabel.SetText(err.Error())
+					return
+				}
+				if isHTML {
+					msg := "this is a web page, not a direct file"
+					if ytdlpErr != nil {
+						msg += " · yt-dlp: " + ytdlpErr.Error()
+					}
+					infoLabel.SetText(msg)
 					return
 				}
 				info := dash(humanBytes(p.Total))
@@ -454,6 +503,8 @@ func (a *application) newAddForm(parent fyne.Window, pre engine.AddOptions, done
 				dialog.ShowError(err, parent)
 				return
 			}
+			j.EmbedThumbnail = embedThumbCheck.Visible() && embedThumbCheck.Checked
+			j.EmbedMetadata = embedMetaCheck.Visible() && embedMetaCheck.Checked
 			ytdlpJob = &j
 		case streamFor == url && streamErr != nil:
 			dialog.ShowError(streamErr, parent)

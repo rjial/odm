@@ -22,7 +22,18 @@ All notable changes to ODM are documented here. The format is based on
   appears when the page has a visible `<video>` but nothing recognizable
   was sniffed from the network (an encrypted or otherwise unrecognized
   segment format, for instance); clicking it hands the page itself to the
-  New Download window, which tries it with the fallback above.
+  New Download window, which tries it with the fallback above. On a feed
+  or grid page with several videos at once (Instagram's, for instance),
+  every visible one gets its own button instead of just the largest; a
+  page whose own address already names one specific reel/post is always
+  handed off directly, by that address, ignoring whatever else was
+  sniffed — a vertical feed can preload several items' media at once,
+  with no reliable way to tell which is which from the network side
+  alone, but the address itself is always right.
+- New Download window: yt-dlp's own `--embed-thumbnail`/`--embed-metadata`
+  are offered as two independent checkboxes whenever its "Audio only"
+  quality is picked (needs a configured ffmpeg); each remembers its own
+  on/off choice for next time.
 
 ### Fixed
 
@@ -39,6 +50,11 @@ All notable changes to ODM are documented here. The format is based on
   so the download was a corrupt, unplayable fragment missing its
   container header. Those parameters are stripped before the file is
   fetched.
+- New Download window: an address that is really a web page (Instagram's
+  reel/post permalinks, for instance) still "succeeds" as a plain-file
+  probe — the server answers 200 with the page's own HTML, not an error —
+  so it was downloaded, broken, as if it really were a file instead of
+  being tried with the yt-dlp fallback above.
 
 ## [0.5.0] - 2026-10-19
 

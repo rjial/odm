@@ -123,6 +123,13 @@ type Settings struct {
 	// set up, or fails on a given video) to run yt-dlp/ejs's signature
 	// solver. Empty: look next to ODM, then on PATH.
 	NodePath string `json:"node_path,omitempty"`
+	// YtDlpNoEmbedThumbnail/YtDlpNoEmbedMetadata remember the New Download
+	// window's own "Audio only" checkboxes (on by default, named in the
+	// negative so the zero value matches that) across downloads and
+	// sessions: cover art and title/artist tags on an audio-only yt-dlp
+	// download, each independently.
+	YtDlpNoEmbedThumbnail bool `json:"ytdlp_no_embed_thumbnail,omitempty"`
+	YtDlpNoEmbedMetadata  bool `json:"ytdlp_no_embed_metadata,omitempty"`
 }
 
 // DefaultQueue is the queue used when none is specified.
